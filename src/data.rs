@@ -7,8 +7,3 @@ pub struct HaversinePair {
     pub x1: f64,
     pub y1: f64,
 }
-
-#[derive(Deserialize, Serialize, Debug)]
-pub struct HaversineData {
-    pub pairs: Vec<HaversinePair>,
-}

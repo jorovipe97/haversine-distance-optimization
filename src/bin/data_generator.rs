@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use haversine_distance::data::{HaversineData, HaversinePair};
+use haversine_distance::data::HaversinePair;
 use haversine_distance::hash::fnv1a_hash;
 use rand::distr::{Distribution, Uniform};
 use rand::{SeedableRng, rngs::StdRng};
+use serde::ser::{SerializeSeq, Serializer};
+// use serde_json::Serializer;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
@@ -23,9 +25,6 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let mut pairs: Vec<HaversinePair> = Vec::with_capacity(args.size);
-    let mut distances: Vec<f64> = Vec::with_capacity(args.size);
-
     // See: https://docs.rs/rand/0.10.1/rand/distr/uniform/struct.Uniform.html
     // TODO: This does not create an uniform point in the sphere
     let x_range = Uniform::try_from(-180.0..=180.0)
@@ -41,25 +40,16 @@ fn main() -> Result<()> {
 
     let mut rng = StdRng::seed_from_u64(seed);
 
-    for _ in 1..=args.size {
-        let x0 = x_range.sample(&mut rng);
-        let y0 = y_range.sample(&mut rng);
-        let x1 = x_range.sample(&mut rng);
-        let y1 = y_range.sample(&mut rng);
-
-        // Generate pair:
-        pairs.push(HaversinePair { x0, y0, x1, y1 });
-
-        // Compute haversine distance
-        let haversine = reference_haversine(x0, y0, x1, y1, EARTH_RADIUS);
-        distances.push(haversine);
-    }
-
-    // Create the file with the data
-    let data = HaversineData { pairs };
+    // Create the file with the data, we stream the data to avoid loading all
+    // bytes into memory
     let file_data = File::create(format!("data_{}_haversine.json", args.size))
         .context("failed creating data file")?;
-    serde_json::to_writer(file_data, &data).context("cannot write data file")?;
+    let file_data_writer = BufWriter::new(file_data);
+    let mut file_data_serializer = serde_json::Serializer::new(file_data_writer);
+    // adds [ to the file.
+    let mut file_data_sequence = file_data_serializer
+        .serialize_seq(None)
+        .context("failed to create serialization of sequence")?;
 
     // Write answers file
     let file_answers = File::create(format!("data_{}_answers", args.size))
@@ -68,21 +58,53 @@ fn main() -> Result<()> {
 
     // Hash results, so we can easily check algorithm.
     let mut hash: u64 = 0;
-    // Shuffle to check hash do not changes when changing order of answers.
-    // let mut rng = StdRng::seed_from_u64(seed);
-    // distances.shuffle(&mut rng);
-    for answer in distances {
-        let answer_bytes = answer.to_be_bytes();
+
+    // Note(Dice): if the point of generating the clusters is uniquely to avoid the convergence
+    // of the average distance to its expected value and nothing else you don't actually need to do anything that complicated
+    //
+    // You can just use any non asymptotically deterministic statistic as a benchmark,
+    // the most natural pick is to divide the sum of the values by the square root of
+    // the sample size rather than the sample size itself.
+    //
+    // https://www.computerenhance.com/p/generating-haversine-input-json/comment/84477226
+    let mut verification_statistic: f64 = 0.0;
+
+    for _ in 1..=args.size {
+        let x0 = x_range.sample(&mut rng);
+        let y0 = y_range.sample(&mut rng);
+        let x1 = x_range.sample(&mut rng);
+        let y1 = y_range.sample(&mut rng);
+
+        // Save generated pair into file:
+        // adds an element to the array.
+        file_data_sequence
+            .serialize_element(&HaversinePair { x0, y0, x1, y1 })
+            .with_context(|| "failed to add element to file")?;
+
+        // Compute haversine distance
+        let haversine = reference_haversine(x0, y0, x1, y1, EARTH_RADIUS);
+
+        let answer_bytes = haversine.to_be_bytes();
         file_answers_writer
             .write_all(&answer_bytes)
-            .with_context(|| format!("failed writting answer ({answer})"))?;
+            .with_context(|| format!("failed writting answer ({haversine})"))?;
 
         hash = hash.wrapping_add(fnv1a_hash(&answer_bytes));
+        verification_statistic += haversine;
     }
+
+    verification_statistic = verification_statistic / (args.size as f64).sqrt();
+
+    // Adds the ]
+    file_data_sequence.end().context("failed writing array")?;
 
     file_answers_writer
         .write_all(hash.to_be_bytes().as_ref())
         .context("was not able to write final hash")?;
+
+    file_answers_writer
+        .write_all(verification_statistic.to_be_bytes().as_ref())
+        .context("was not able to write verification statistic")?;
 
     file_answers_writer
         .flush()
@@ -90,7 +112,8 @@ fn main() -> Result<()> {
 
     println!("Random seed: {seed}");
     println!("Pair count: {}", args.size);
-    println!("Checksum (Hex): {:016x}", hash);
+    println!("Results Checksum (Hex): {:016x}", hash);
+    println!("Verification Statistic: {verification_statistic}");
 
     Ok(())
 }
