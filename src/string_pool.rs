@@ -1,8 +1,9 @@
+use std::hash::{Hash};
 use anyhow::{Context, Result, anyhow};
 
 use crate::hash::fnv1a_hash;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub struct PooledString {
     /// The bucket where this pooled string is
     bucket: u16,
@@ -10,6 +11,21 @@ pub struct PooledString {
     /// The offset inside the bucket.
     offset: u16,
 }
+
+// I use my own implementation of hash, to avoid having rust using its default hash
+// to compute this when used as the key of HashMap.
+// TODO: Study more about this as it may have a lot of implication I'm not really sure about.
+//  for example, standard hash considers SIMD optimizations this is not even aware of.
+//  also this class may generate different values depending of the order of two colliding strings
+// impl Hash for PooledString {
+//     #[inline]
+//     fn hash<H: Hasher>(&self, hasher: &mut H) {
+//         // Combine into a single u32; put `bucket` in the low bits
+//         // since HashMap uses the lowest bits for its table index.
+//         let packed = ((self.offset as u32) << 16) | (self.bucket as u32);
+//         hasher.write_u32(packed);
+//     }
+// }
 
 struct StringPoolItem {
     value: String,

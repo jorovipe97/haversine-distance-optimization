@@ -6,7 +6,7 @@
       "args": ["build", "--bin", "parse_json"],
     },
     "program": "$ZED_WORKTREE_ROOT/target/debug/parse_json",
-    "args": ["--file", "data_2_haversine.json"],
+    "args": ["--file", "demo.json"],
     // sourceLanguages is required for CodeLLDB (not GDB) when using Rust
     "sourceLanguages": ["rust"],
     "request": "launch",

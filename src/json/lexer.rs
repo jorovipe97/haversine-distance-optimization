@@ -15,11 +15,14 @@ pub enum Token {
     Text(String),
     Comma,
     Colon,
+    Null,
     Boolean(bool),
     Integer(String),
-    Float(String),
+    Double(String),
     Error(String),
     EndOfFile,
+    /// This means the token has been consumed
+    Consumed,
 }
 
 #[derive(Clone, Copy)]
@@ -52,7 +55,7 @@ enum LexerStates {
     ///
     /// If after dot have a number tracks everything until next non number
     /// character.
-    LookingIntegerOrFloat,
+    LookingIntegerOrDouble,
 
     /// This state finish the iterator before reading the whole file,
     /// use this to finish iterator after finding an error.
@@ -66,10 +69,11 @@ pub struct BufferedJsonLexer {
     state: LexerStates,
 
     /// Since we are reading from a buffer, we cannot keep a reference
-    /// to original data, as is it will be later overwriten.
+    /// to original data, as is it will be later overwritten.
     current_token_accumulator: Vec<u8>,
     current_token_accumulator_kind: Option<AccumulableTokensKind>,
     is_current_token_float: bool,
+    number_has_exponent: bool,
 }
 
 impl BufferedJsonLexer {
@@ -84,6 +88,25 @@ impl BufferedJsonLexer {
             current_token_accumulator: Vec::with_capacity(1024),
             current_token_accumulator_kind: None,
             is_current_token_float: false,
+            number_has_exponent: false,
+        })
+    }
+
+    /// Opens a file using a BufReader with the capacity specified in size.
+    ///
+    /// This is useful just for testing purposes.
+    pub fn from_file_with_capacity(file_path: &str, size: usize) -> Result<BufferedJsonLexer> {
+        let f = File::open(file_path)
+            .context("could not open the file when creating the BufferedJsonLexer")?;
+
+        Ok(BufferedJsonLexer {
+            // By default has a buffer capacity of 8 KiB
+            buf_reader: BufReader::with_capacity(size, f),
+            state: LexerStates::LookingDelimiters,
+            current_token_accumulator: Vec::with_capacity(1024),
+            current_token_accumulator_kind: None,
+            is_current_token_float: false,
+            number_has_exponent: false,
         })
     }
 }
@@ -111,7 +134,7 @@ impl Iterator for BufferedJsonLexer {
                         if let Ok(numeric_value) =
                             String::from_utf8(self.current_token_accumulator.clone())
                         {
-                            tokens_batch.push(Token::Float(numeric_value))
+                            tokens_batch.push(Token::Double(numeric_value))
                         }
                     }
                     AccumulableTokensKind::Integer => {
@@ -180,9 +203,21 @@ impl Iterator for BufferedJsonLexer {
                                 break;
                             }
                         }
+                        b'n' => {
+                            // Checks if we have a null sequence.
+                            if &data_chunk[i..i + 4] == b"null" {
+                                tokens_batch.push(Token::Null);
+                                delta = 4; // Advance after the "null" sequence.
+                            } else {
+                                tokens_batch
+                                    .push(Token::Error(String::from("found unexpected sequence")));
+                                self.state = LexerStates::EarlyFinish;
+                                break;
+                            }
+                        }
                         b'0'..=b'9' | b'-' => {
                             // A json number cannot start with + symbol
-                            self.state = LexerStates::LookingIntegerOrFloat;
+                            self.state = LexerStates::LookingIntegerOrDouble;
                             // Intentionally do not move
                             continue;
                         }
@@ -229,6 +264,7 @@ impl Iterator for BufferedJsonLexer {
                             self.state = LexerStates::EarlyFinish;
                             break;
                         }
+                        self.current_token_accumulator_kind = None;
                         self.current_token_accumulator.clear();
                         // Note we can have an empty string as key or value.
                         // End of string token, go back to main state.
@@ -236,18 +272,47 @@ impl Iterator for BufferedJsonLexer {
                     } else {
                         // Accumulate, bytes for the text
                         self.current_token_accumulator.push(item);
+                        self.current_token_accumulator_kind = Some(AccumulableTokensKind::Text);
                     }
                 }
-                LexerStates::LookingIntegerOrFloat => {
+                LexerStates::LookingIntegerOrDouble => {
                     // A number cannot start with a leading 0, eg: 012 is invalid
                     // only 0. is valid
                     if let Some(first_item) = self.current_token_accumulator.get(0) {
-                        if *first_item == b'-' && item == b'-' {
-                            tokens_batch.push(Token::Error(String::from(
-                                "a number cannot have multiple minus symbols",
-                            )));
-                            self.state = LexerStates::EarlyFinish;
-                            break;
+                        // Minus can be at start of after an e.
+                        if let Some(prev_item) = self
+                            .current_token_accumulator
+                            .get(self.current_token_accumulator.len() - 1)
+                        {
+                            if *first_item == b'-'
+                                && *prev_item != b'e'
+                                && *prev_item != b'E'
+                                && item == b'-'
+                            {
+                                tokens_batch.push(Token::Error(String::from(
+                                    "a number cannot have multiple minus symbols",
+                                )));
+                                self.state = LexerStates::EarlyFinish;
+                                break;
+                            }
+
+                            // Minus symbold should be at the start or after an e
+                            if self.current_token_accumulator.len() > 0
+                                && *prev_item != b'e'
+                                && *prev_item != b'E'
+                                && item == b'-'
+                            {
+                                tokens_batch.push(Token::Error(String::from(
+                                    "the minus symbols must be at the start or after an exponent",
+                                )));
+                                self.state = LexerStates::EarlyFinish;
+                                break;
+                            }
+
+                            // If a menus is found after the exponent, then number is float
+                            if (*prev_item == b'e' || *prev_item == b'E') && item == b'-' {
+                                self.is_current_token_float = true;
+                            }
                         }
 
                         if *first_item == b'0'
@@ -262,6 +327,22 @@ impl Iterator for BufferedJsonLexer {
                             self.state = LexerStates::EarlyFinish;
                             break;
                         }
+                    }
+
+                    if item == b'e' || item == b'E' {
+                        self.number_has_exponent = true;
+                        self.current_token_accumulator.push(item);
+                        i = i + delta; // Move to next character
+                        continue;
+                    }
+
+                    // If point is in the exponent part, then error
+                    if self.number_has_exponent && item == b'.' {
+                        tokens_batch.push(Token::Error(String::from(
+                            "the exponent cannot have decimal points",
+                        )));
+                        self.state = LexerStates::EarlyFinish;
+                        break;
                     }
 
                     if item == b'.' {
@@ -285,13 +366,17 @@ impl Iterator for BufferedJsonLexer {
                         self.current_token_accumulator_kind = Some(AccumulableTokensKind::Integer);
                     }
 
-                    // Finish number token if we found anything that is not a number or a dot or a minus
-                    if (item < b'0' || item > b'9') && item != b'-' && item != b'.' {
+                    // Finish number token if we found anything that is not a number or a dot or a minus or a e
+                    if (item < b'0' || item > b'9')
+                        && item != b'-'
+                        && item != b'.'
+                        && (item != b'e' || item != b'E')
+                    {
                         if let Ok(numeric_value) =
                             String::from_utf8(self.current_token_accumulator.clone())
                         {
                             if self.is_current_token_float {
-                                tokens_batch.push(Token::Float(numeric_value));
+                                tokens_batch.push(Token::Double(numeric_value));
                             } else {
                                 tokens_batch.push(Token::Integer(numeric_value));
                             }
@@ -300,6 +385,7 @@ impl Iterator for BufferedJsonLexer {
                             self.is_current_token_float = false;
                             self.current_token_accumulator_kind = None;
                             self.state = LexerStates::LookingDelimiters;
+                            self.number_has_exponent = false;
                             // Intentionally do not advance counter so that LookingDelimiters
                             // can analyze the current token
 
@@ -329,7 +415,7 @@ impl Iterator for BufferedJsonLexer {
 
 #[cfg(test)]
 mod tests {
-    use crate::json_lexer::{BufferedJsonLexer, Token};
+    use crate::json::lexer::{BufferedJsonLexer, Token};
     use crate::temporary_test_file::TemporaryTestFile;
     use anyhow::{Result, anyhow};
 
@@ -362,7 +448,6 @@ mod tests {
             }
         }
 
-        temp_file.cleanup()?;
         Ok(())
     }
 
@@ -395,7 +480,7 @@ mod tests {
             Token::ArrayStart,
             Token::Integer(String::from("1")),
             Token::Comma,
-            Token::Float(String::from("2.0")),
+            Token::Double(String::from("2.0")),
             Token::Comma,
             Token::Text(String::from("-4")),
             Token::ArrayEnd,
@@ -411,7 +496,6 @@ mod tests {
             }
         }
 
-        temp_file.cleanup()?;
         Ok(())
     }
 
@@ -447,7 +531,6 @@ mod tests {
             }
         }
 
-        temp_file.cleanup()?;
         Ok(())
     }
 
@@ -483,7 +566,6 @@ mod tests {
             }
         }
 
-        temp_file.cleanup()?;
         Ok(())
     }
 
@@ -519,7 +601,6 @@ mod tests {
             }
         }
 
-        temp_file.cleanup()?;
         Ok(())
     }
 
@@ -539,17 +620,16 @@ mod tests {
             }
         }
 
-        println!("{:?}", received_token);
         if received_token.len() != 10 {
             panic!("should find 10 tokens but got {}", received_token.len());
         }
 
         let expected_tokens = [
-            Token::Float(String::from("0.22343")),
+            Token::Double(String::from("0.22343")),
             Token::Comma,
-            Token::Float(String::from("123.123")),
+            Token::Double(String::from("123.123")),
             Token::Comma,
-            Token::Float(String::from("-42.34")),
+            Token::Double(String::from("-42.34")),
             Token::Comma,
             Token::Integer(String::from("12")),
             Token::Comma,
@@ -565,7 +645,6 @@ mod tests {
             }
         }
 
-        temp_file.cleanup()?;
         Ok(())
     }
 
@@ -586,20 +665,18 @@ mod tests {
             }
         }
 
-        println!("{:?}", received_token);
-
         if received_token.len() != 14 {
             return Err(anyhow!("should find 14 tokens"));
         }
 
         let expected_tokens = [
-            Token::Float(String::from("0.22343")),
+            Token::Double(String::from("0.22343")),
             Token::Comma,
-            Token::Float(String::from("123.123")),
+            Token::Double(String::from("123.123")),
             Token::Comma,
             Token::Text(String::from("hola,")),
             Token::Comma,
-            Token::Float(String::from("-42.34")),
+            Token::Double(String::from("-42.34")),
             Token::Comma,
             Token::Integer(String::from("12")),
             Token::Comma,
@@ -617,7 +694,53 @@ mod tests {
             }
         }
 
-        temp_file.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn should_tokenize_accumulable_token_split_in_different_buffer_chunks() -> Result<()> {
+        let content = r#"12.2"#;
+        let temp_file = TemporaryTestFile::new(
+            "should_tokenize_accumulable_token_split_in_different_buffer_chunks.json",
+            content,
+        )?;
+
+        let file_path = temp_file.full_file_path().unwrap();
+        let buffer_size = 2; // 2 bytes buffer size.
+        let lexer = BufferedJsonLexer::from_file_with_capacity(file_path, buffer_size)?;
+
+        let mut received_token: Vec<Token> = Vec::new();
+
+        let mut iterations_count = 0;
+        for tokens_batch in lexer {
+            iterations_count += 1;
+            for token in tokens_batch {
+                received_token.push(token);
+            }
+        }
+
+        if iterations_count != 3 {
+            // Total text has 4 bytes.
+            // First iteration is for first 2 bytes that fill in the buffer.
+            // Second iteration is for the next 2 bytes that fill in the buffer.
+            // Third iteration is for the finish iteration.
+            panic!("was expecting 3 iterations but got {iterations_count}")
+        }
+
+        if received_token.len() != 2 {
+            panic!("should find 2 tokens but got {}", received_token.len());
+        }
+
+        let expected_tokens = [Token::Double(String::from("12.2")), Token::EndOfFile];
+        for (i, token) in received_token.iter().enumerate() {
+            if *token != expected_tokens[i] {
+                panic!(
+                    "token ({:?}) do not match expected token ({:?})",
+                    *token, expected_tokens[i]
+                );
+            }
+        }
+
         Ok(())
     }
 }

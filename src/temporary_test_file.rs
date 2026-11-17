@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::fs::{self, File, remove_file};
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -31,11 +31,14 @@ impl TemporaryTestFile {
     pub fn full_file_path(&self) -> Option<&str> {
         self.file_path.to_str()
     }
+}
 
-    pub fn cleanup(&self) -> Result<()> {
-        remove_file(&self.file_path).context("could not remove temporary file")?;
-
-        println!("removed temp file at {:?}", &self.file_path);
-        Ok(())
+impl Drop for TemporaryTestFile {
+    fn drop(&mut self) {
+        let result = fs::remove_file(&self.file_path).context("could not remove temporary file");
+        match result {
+            Ok(_) => println!("removed temp file at {:?}", &self.file_path),
+            Err(err) => println!("{}", err),
+        }
     }
 }
